@@ -1,0 +1,623 @@
+Flask
+Flask-SQLAlchemy
+Flask-Login
+Flask-WTF
+WTForms
+pandas
+openpyxl
+Werkzeugfrom flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from datetime import datetime
+
+db = SQLAlchemy()
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+
+class Customer(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    tc_number = db.Column(db.String(11))
+    phone = db.Column(db.String(20))
+    email = db.Column(db.String(120))
+    company = db.Column(db.String(120))
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+
+class CustomerNote(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    text = db.Column(db.Text)
+    photo = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class CustomerFile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    filename = db.Column(db.String(255))
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class PhoneCall(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'))
+    call_time = db.Column(db.DateTime, default=datetime.utcnow)
+    duration = db.Column(db.Integer)  # saniye
+    direction = db.Column(db.String(10))
+    notes = db.Column(db.Text)
+    recording_url = db.Column(db.String(255))
+
+class Reminder(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'))
+    remind_at = db.Column(db.DateTime, nullable=False)
+    note = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField, FloatField, TextAreaField, DateField, DateTimeLocalField, SelectField, BooleanField
+from wtforms.validators import DataRequired
+from flask_wtf.file import FileField, FileAllowed
+
+class LoginForm(FlaskForm):
+    username = StringField('Kullanıcı Adı', validators=[DataRequired()])
+    password = PasswordField('Şifre', validators=[DataRequired()])
+    submit = SubmitField('Giriş Yap')
+
+class UserForm(FlaskForm):
+    username = StringField('Kullanıcı Adı', validators=[DataRequired()])
+    password = PasswordField('Şifre', validators=[DataRequired()])
+    is_admin = BooleanField('Admin mi?')
+    submit = SubmitField('Kaydet')
+
+class ChangePasswordForm(FlaskForm):
+    old_password = PasswordField('Eski Şifre', validators=[DataRequired()])
+    new_password = PasswordField('Yeni Şifre', validators=[DataRequired()])
+    confirm_password = PasswordField('Yeni Şifreyi Onayla', validators=[DataRequired()])
+    submit = SubmitField('Şifreyi Değiştir')
+
+class CustomerForm(FlaskForm):
+    name = StringField('Adı', validators=[DataRequired()])
+    tc_number = StringField('TC Kimlik No')
+    phone = StringField('Telefon')
+    email = StringField('E-posta')
+    company = StringField('Firma')
+    notes = TextAreaField('Notlar')
+    submit = SubmitField('Kaydet')
+
+class NoteForm(FlaskForm):
+    text = TextAreaField('Not', validators=[DataRequired()])
+    photo = FileField('Fotoğraf', validators=[FileAllowed(['jpg', 'png', 'jpeg', 'gif'], 'Sadece resim dosyaları!')])
+    submit_note = SubmitField('Not Ekle')
+
+class FileUploadForm(FlaskForm):
+    file = FileField('Dosya Seç', validators=[DataRequired()])
+    submit_file = SubmitField('Yükle')
+
+class ReminderForm(FlaskForm):
+    remind_at = DateTimeLocalField('Hatırlatma Tarihi', format='%Y-%m-%dT%H:%M', validators=[DataRequired()])
+    note = TextAreaField('Açıklama', validators=[DataRequired()])
+    submit = SubmitField('Hatırlatma Ekle')import os
+from flask import Flask, render_template, redirect, url_for, request, flash, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime
+import pandas as pd
+import io
+
+from models import db, User, Customer, CustomerNote, CustomerFile, PhoneCall, Reminder
+from forms import LoginForm, UserForm, ChangePasswordForm, CustomerForm, NoteForm, FileUploadForm, ReminderForm
+
+UPLOAD_FOLDER = 'static/uploads/notes'
+UPLOAD_CUSTOMER_FILES = 'static/uploads/customer_files'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_CUSTOMER_FILES, exist_ok=True)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'gizli-anahtar'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///crm.db'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['UPLOAD_CUSTOMER_FILES'] = UPLOAD_CUSTOMER_FILES
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.before_first_request
+def create_tables():
+    db.create_all()
+
+# Kullanıcı Girişi/Çıkışı
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(username=form.username.data).first()
+        if user and check_password_hash(user.password, form.password.data):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+        flash('Kullanıcı adı veya şifre yanlış.')
+    return render_template('login.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+# Dashboard
+@app.route('/')
+@login_required
+def dashboard():
+    customer_count = Customer.query.count() if current_user.is_admin else Customer.query.filter_by(owner_id=current_user.id).count()
+    reminder_count = Reminder.query.count() if current_user.is_admin else Reminder.query.filter_by(user_id=current_user.id).count()
+    return render_template('dashboard.html', customer_count=customer_count, reminder_count=reminder_count)
+
+# Kullanıcı Yönetimi
+@app.route('/admin/users')
+@login_required
+def user_list():
+    if not current_user.is_admin:
+        return redirect(url_for('dashboard'))
+    users = User.query.all()
+    return render_template('user_list.html', users=users)
+
+@app.route('/admin/add_user', methods=['GET', 'POST'])
+@login_required
+def add_user():
+    if not current_user.is_admin:
+        return redirect(url_for('dashboard'))
+    form = UserForm()
+    if form.validate_on_submit():
+        hashed_pw = generate_password_hash(form.password.data)
+        user = User(username=form.username.data, password=hashed_pw, is_admin=form.is_admin.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('Kullanıcı eklendi!')
+        return redirect(url_for('user_list'))
+    return render_template('add_user.html', form=form)
+
+@app.route('/admin/delete_user/<int:id>', methods=['POST'])
+@login_required
+def delete_user(id):
+    if not current_user.is_admin:
+        return redirect(url_for('dashboard'))
+    user = User.query.get_or_404(id)
+    db.session.delete(user)
+    db.session.commit()
+    flash('Kullanıcı silindi!')
+    return redirect(url_for('user_list'))
+
+# Şifre Değiştirme
+@app.route('/change_password', methods=['GET', 'POST'])
+@login_required
+def change_password():
+    form = ChangePasswordForm()
+    if form.validate_on_submit():
+        if not check_password_hash(current_user.password, form.old_password.data):
+            flash('Eski şifre yanlış!')
+            return redirect(url_for('change_password'))
+        if form.new_password.data != form.confirm_password.data:
+            flash('Yeni şifreler eşleşmiyor!')
+            return redirect(url_for('change_password'))
+        current_user.password = generate_password_hash(form.new_password.data)
+        db.session.commit()
+        flash('Şifreniz değiştirildi.')
+        return redirect(url_for('dashboard'))
+    return render_template('change_password.html', form=form)
+
+# Müşteri Listeleme
+@app.route('/customers')
+@login_required
+def customers():
+    if current_user.is_admin:
+        all_customers = Customer.query.all()
+    else:
+        all_customers = Customer.query.filter_by(owner_id=current_user.id).all()
+    return render_template('customers.html', customers=all_customers)
+
+# Müşteri Ekle
+@app.route('/customer/add', methods=['GET', 'POST'])
+@login_required
+def add_customer():
+    form = CustomerForm()
+    if form.validate_on_submit():
+        # TC veya telefon ile aynı kullanıcıda kayıt var mı kontrolü
+        existing = Customer.query.filter(
+            Customer.owner_id == current_user.id,
+            ((Customer.tc_number == form.tc_number.data) & (Customer.tc_number != None)) | 
+            ((Customer.phone == form.phone.data) & (Customer.phone != None))
+        ).first()
+        if existing:
+            flash('Aynı TC veya telefon numarası ile müşteri zaten kayıtlı.', 'danger')
+            return redirect(url_for('add_customer'))
+        customer = Customer(
+            name=form.name.data,
+            tc_number=form.tc_number.data,
+            phone=form.phone.data,
+            email=form.email.data,
+            company=form.company.data,
+            notes=form.notes.data,
+            owner_id=current_user.id
+        )
+        db.session.add(customer)
+        db.session.commit()
+        flash('Müşteri eklendi!')
+        return redirect(url_for('customers'))
+    return render_template('customer_form.html', form=form)
+
+# Müşteri Düzenle, Not Ekle, Dosya Ekle
+@app.route('/customer/edit/<int:id>', methods=['GET', 'POST'])
+@login_required
+def edit_customer(id):
+    customer = Customer.query.get_or_404(id)
+    if not (current_user.is_admin or customer.owner_id == current_user.id):
+        flash('Yetkiniz yok.', 'danger')
+        return redirect(url_for('customers'))
+    form = CustomerForm(obj=customer)
+    note_form = NoteForm()
+    file_form = FileUploadForm()
+    notes = CustomerNote.query.filter_by(customer_id=id).order_by(CustomerNote.created_at.desc()).all()
+    files = CustomerFile.query.filter_by(customer_id=id).all()
+    if form.validate_on_submit():
+        customer.name = form.name.data
+        customer.tc_number = form.tc_number.data
+        customer.phone = form.phone.data
+        customer.email = form.email.data
+        customer.company = form.company.data
+        customer.notes = form.notes.data
+        db.session.commit()
+        flash('Müşteri güncellendi!')
+        return redirect(url_for('edit_customer', id=id))
+    return render_template('customer_edit.html', form=form, note_form=note_form, file_form=file_form, notes=notes, files=files, customer=customer)
+
+@app.route('/customer/<int:id>/add_note', methods=['POST'])
+@login_required
+def add_note(id):
+    customer = Customer.query.get_or_404(id)
+    note_form = NoteForm()
+    if note_form.validate_on_submit():
+        filename = None
+        if note_form.photo.data:
+            file = note_form.photo.data
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+        note = CustomerNote(
+            customer_id=id,
+            user_id=current_user.id,
+            text=note_form.text.data,
+            photo=filename
+        )
+        db.session.add(note)
+        db.session.commit()
+        flash('Not ve fotoğraf eklendi!')
+    return redirect(url_for('edit_customer', id=id))
+
+@app.route('/customer/<int:id>/upload_file', methods=['POST'])
+@login_required
+def upload_customer_file(id):
+    customer = Customer.query.get_or_404(id)
+    form = FileUploadForm()
+    if form.validate_on_submit():
+        file = form.file.data
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(app.config['UPLOAD_CUSTOMER_FILES'], filename))
+        customer_file = CustomerFile(
+            customer_id=id,
+            user_id=current_user.id,
+            filename=filename
+        )
+        db.session.add(customer_file)
+        db.session.commit()
+        flash('Dosya yüklendi!')
+    return redirect(url_for('edit_customer', id=id))
+
+@app.route('/customer/delete/<int:id>', methods=['POST'])
+@login_required
+def delete_customer(id):
+    customer = Customer.query.get_or_404(id)
+    if not (current_user.is_admin or customer.owner_id == current_user.id):
+        flash('Yetkiniz yok.', 'danger')
+        return redirect(url_for('customers'))
+    db.session.delete(customer)
+    db.session.commit()
+    flash('Müşteri silindi!')
+    return redirect(url_for('customers'))
+
+# Müşteri Paylaşımı (Admin)
+@app.route('/customer/assign/<int:id>', methods=['GET', 'POST'])
+@login_required
+def assign_customer(id):
+    if not current_user.is_admin:
+        flash('Bu işlemi sadece ana kullanıcı gerçekleştirebilir.')
+        return redirect(url_for('customers'))
+    customer = Customer.query.get_or_404(id)
+    users = User.query.filter(User.id != current_user.id).all()
+    if request.method == 'POST':
+        user_id = int(request.form['user_id'])
+        existing_customer = Customer.query.filter(
+            (Customer.owner_id == user_id) &
+            (
+                (Customer.tc_number == customer.tc_number) | 
+                (Customer.phone == customer.phone)
+            )
+        ).first()
+        if existing_customer:
+            flash('Seçilen kullanıcıda aynı TC veya telefon var! Atama yapılamaz.', 'danger')
+            return redirect(url_for('assign_customer', id=customer.id))
+        customer.owner_id = user_id
+        db.session.commit()
+        flash('Müşteri kullanıcıya atandı!')
+        return redirect(url_for('customers'))
+    return render_template('assign_customer.html', customer=customer, users=users)
+
+# Excel'den Toplu Müşteri Alımı
+@app.route('/customers/import', methods=['GET', 'POST'])
+@login_required
+def import_customers():
+    if not current_user.is_admin:
+        flash('Sadece admin toplu müşteri yükleyebilir.')
+        return redirect(url_for('customers'))
+    if request.method == 'POST':
+        file = request.files['file']
+        if file:
+            df = pd.read_excel(file)
+            for _, row in df.iterrows():
+                customer = Customer(
+                    name=row['Adı'],
+                    tc_number=row.get('TC', ''),
+                    phone=row.get('Telefon', ''),
+                    email=row.get('E-posta', ''),
+                    company=row.get('Firma', ''),
+                    notes=row.get('Notlar', ''),
+                    owner_id=current_user.id
+                )
+                db.session.add(customer)
+            db.session.commit()
+            flash('Toplu müşteri yüklemesi tamamlandı!')
+            return redirect(url_for('customers'))
+    return render_template('import_customers.html')
+
+# Excel Çıktısı Alımı
+@app.route('/customers/export/excel')
+@login_required
+def export_customers_excel():
+    if current_user.is_admin:
+        customers = Customer.query.all()
+    else:
+        customers = Customer.query.filter_by(owner_id=current_user.id).all()
+    data = [{
+        "Adı": c.name,
+        "TC": c.tc_number,
+        "Telefon": c.phone,
+        "E-posta": c.email,
+        "Firma": c.company,
+        "Notlar": c.notes,
+    } for c in customers]
+    df = pd.DataFrame(data)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False)
+    output.seek(0)
+    return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True, download_name='musteriler.xlsx')
+
+# Telefon Kayıtları (sadece admin görebilir)
+@app.route('/phonecalls')
+@login_required
+def phonecalls():
+    if not current_user.is_admin:
+        flash('Bu sayfaya erişim yetkiniz yok.')
+        return redirect(url_for('dashboard'))
+    calls = PhoneCall.query.order_by(PhoneCall.call_time.desc()).all()
+    return render_template('phonecalls.html', calls=calls)
+
+@app.route('/api/phonecall', methods=['POST'])
+def api_phonecall():
+    data = request.json
+    call = PhoneCall(
+        user_id=data['user_id'],
+        customer_id=data['customer_id'],
+        call_time=datetime.strptime(data['call_time'], "%Y-%m-%d %H:%M:%S"),
+        duration=data['duration'],
+        direction=data['direction'],
+        notes=data.get('notes', ''),
+        recording_url=data.get('recording_url', '')
+    )
+    db.session.add(call)
+    db.session.commit()
+    return {"status": "ok"}, 201
+
+# Hatırlatmalar
+@app.route('/customer/<int:customer_id>/reminder', methods=['GET', 'POST'])
+@login_required
+def add_reminder(customer_id):
+    form = ReminderForm()
+    customer = Customer.query.get_or_404(customer_id)
+    if form.validate_on_submit():
+        reminder = Reminder(
+            user_id=current_user.id,
+            customer_id=customer_id,
+            remind_at=form.remind_at.data,
+            note=form.note.data
+        )
+        db.session.add(reminder)
+        db.session.commit()
+        flash('Hatırlatma eklendi!')
+        return redirect(url_for('edit_customer', id=customer_id))
+    reminders = Reminder.query.filter_by(customer_id=customer_id).order_by(Reminder.remind_at.desc()).all()
+    return render_template('add_reminder.html', form=form, customer=customer, reminders=reminders)
+
+@app.route('/my_reminders')
+@login_required
+def my_reminders():
+    now = datetime.utcnow()
+    reminders = Reminder.query.filter(
+        Reminder.user_id == current_user.id,
+        Reminder.remind_at >= now
+    ).order_by(Reminder.remind_at).all()
+    return render_template('my_reminders.html', reminders=reminders)
+
+@app.route('/all_reminders')
+@login_required
+def all_reminders():
+    if not current_user.is_admin:
+        flash('Bu sayfaya erişim izniniz yok.')
+        return redirect(url_for('dashboard'))
+    reminders = Reminder.query.order_by(Reminder.remind_at).all()
+    return render_template('all_reminders.html', reminders=reminders)
+
+if __name__ == '__main__':
+    app.run(debug=True){% extends "layout.html" %}
+{% block content %}
+<h2>Dashboard</h2>
+<ul>
+    <li>Müşteri Sayısı: {{ customer_count }}</li>
+    <li>Açık Fırsat Sayısı: {{ opportunity_open }}</li>
+    <li>Bekleyen Görev Sayısı: {{ task_pending }}</li>
+</ul>
+{% endblock %}{% extends "layout.html" %}
+{% block content %}
+<h2>Telefon Görüşmeleri Kayıtları</h2>
+<table>
+    <tr>
+        <th>Kullanıcı</th>
+        <th>Müşteri</th>
+        <th>Tarih/Saat</th>
+        <th>Süre (sn)</th>
+        <th>Yön</th>
+        <th>Not</th>
+        <th>Kayıt</th>
+    </tr>
+    {% for call in calls %}
+    <tr>
+        <td>{{ call.user.username }}</td>
+        <td>{{ call.customer.name }}</td>
+        <td>{{ call.call_time.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td>{{ call.duration }}</td>
+        <td>{{ call.direction }}</td>
+        <td>{{ call.notes }}</td>
+        <td>
+            {% if call.recording_url %}
+                <a href="{{ call.recording_url }}" target="_blank">Dinle</a>
+            {% else %}
+                Yok
+            {% endif %}
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+{% endblock %}{% extends "layout.html" %}
+{% block content %}
+<h2>{{ customer.name }} Düzenle</h2>
+<form method="post" enctype="multipart/form-data">
+    {{ form.hidden_tag() }}
+    {{ form.name.label }} {{ form.name() }} <br>
+    {{ form.tc_number.label }} {{ form.tc_number() }} <br>
+    {{ form.phone.label }} {{ form.phone() }} <br>
+    {{ form.email.label }} {{ form.email() }} <br>
+    {{ form.company.label }} {{ form.company() }} <br>
+    {{ form.notes.label }} {{ form.notes() }} <br>
+    <input type="submit" value="Kaydet">
+</form>
+
+<h3>Notlar</h3>
+<form method="post" action="{{ url_for('add_note', id=customer.id) }}" enctype="multipart/form-data">
+    {{ note_form.hidden_tag() }}
+    {{ note_form.text.label }} {{ note_form.text() }} <br>
+    {{ note_form.photo.label }} {{ note_form.photo() }} <br>
+    {{ note_form.submit_note() }}
+</form>
+<ul>
+{% for note in notes %}
+    <li>
+        {{ note.text }} 
+        {% if note.photo %}
+            <br><img src="{{ url_for('static', filename='uploads/notes/' ~ note.photo) }}" width="100">
+        {% endif %}
+        <br>{{ note.user.username }} - {{ note.created_at }}
+    </li>
+{% endfor %}
+</ul>
+
+<h3>Dosya Yükle</h3>
+<form method="post" action="{{ url_for('upload_customer_file', id=customer.id) }}" enctype="multipart/form-data">
+    {{ file_form.hidden_tag() }}
+    {{ file_form.file.label }} {{ file_form.file() }}
+    {{ file_form.submit_file() }}
+</form>
+<ul>
+{% for f in files %}
+    <li>
+        <a href="{{ url_for('static', filename='uploads/customer_files/' ~ f.filename) }}">{{ f.filename }}</a>
+        ({{ f.user.username }}, {{ f.uploaded_at }})
+    </li>
+{% endfor %}
+</ul>
+
+<a href="{{ url_for('add_reminder', customer_id=customer.id) }}">Hatırlatma Ekle/Görüntüle</a>
+{% endblock %}{% extends "layout.html" %}
+{% block content %}
+<h2>Yaklaşan Hatırlatmalarım</h2>
+<ul>
+  {% for rem in reminders %}
+    <li>
+      <b>{{ rem.remind_at.strftime('%Y-%m-%d %H:%M') }}</b> - {{ rem.customer.name }}: {{ rem.note }}
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}{% extends "layout.html" %}
+{% block content %}
+<h2>Bütün Hatırlatmalar</h2>
+<ul>
+  {% for rem in reminders %}
+    <li>
+      <b>{{ rem.remind_at.strftime('%Y-%m-%d %H:%M') }}</b> - {{ rem.customer.name }} ({{ rem.user.username }}): {{ rem.note }}
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <title>CRM Paneli</title>
+</head>
+<body>
+  <h1>CRM Paneli</h1>
+  {% with messages = get_flashed_messages(with_categories=True) %}
+    {% if messages %}
+      {% for cat, msg in messages %}
+        <div class="alert alert-{{cat}}">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+  <nav>
+    <a href="{{ url_for('dashboard') }}">Dashboard</a> |
+    <a href="{{ url_for('customers') }}">Müşteriler</a> |
+    <a href="{{ url_for('my_reminders') }}">Hatırlatmalarım</a>
+    {% if current_user.is_admin %}
+      | <a href="{{ url_for('user_list') }}">Kullanıcılar</a>
+      | <a href="{{ url_for('all_reminders') }}">Tüm Hatırlatmalar</a>
+      | <a href="{{ url_for('phonecalls') }}">Telefon Kayıtları</a>
+      | <a href="{{ url_for('import_customers') }}">Excelden Yükle</a>
+      | <a href="{{ url_for('export_customers_excel') }}">Excel İndir</a>
+    {% endif %}
+    | <a href="{{ url_for('change_password') }}">Şifre Değiştir</a>
+    | <a href="{{ url_for('logout') }}">Çıkış</a>
+  </nav>
+  <hr>
+  {% block content %}{% endblock %}
+</body>
+</html>
